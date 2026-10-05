@@ -1,0 +1,773 @@
+substitutions:
+  device_name: "senso4s-ble-reader"
+  friendly_name: "Senso4s BLE Reader"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+
+# ============================================================
+# SENSO4S BLE READER
+#
+# Reverse engineering / monitoring of Senso4s BLE advertising.
+#
+# Manufacturer ID:
+#   09CC
+#
+# Observed packet length:
+#   12 bytes
+#
+# Packet layout:
+#
+#   B0  B1  B2  B3  B4  B5  B6  B7  B8  B9  B10 B11
+#
+# Known:
+#   B0       Flags / model + usage mode
+#   B1       Gas level (%)
+#   B4       Battery level (%)
+#   B6-B11   Device MAC address
+#
+# Experimental:
+#   B2/B3    Correlates with remaining-time prognosis
+#
+# IMPORTANT:
+#   This configuration only listens to BLE advertisements.
+#   No GATT writes are performed.
+#
+#   Calibration and setup are performed using the Senso4s app.
+#
+#   B2/B3 interpretation is empirical and must be considered
+#   experimental. It is NOT an official Senso4s protocol
+#   specification.
+# ============================================================
+
+
+globals:
+
+  # ----------------------------------------------------------
+  # Store the latest complete 12-byte packet
+  # ----------------------------------------------------------
+
+  - id: senso4s_initialized
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: senso4s_data
+    type: uint8_t[12]
+    restore_value: no
+
+
+# ============================================================
+# SENSORS
+# ============================================================
+
+sensor:
+
+  # ----------------------------------------------------------
+  # Gas level
+  #
+  # Verified from observed Senso4s packets.
+  # ----------------------------------------------------------
+
+  - platform: template
+    name: "Senso4s Gas Level"
+    id: senso4s_gas_level
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+
+  # ----------------------------------------------------------
+  # Sensor battery level
+  #
+  # Verified from observed Senso4s packets.
+  # ----------------------------------------------------------
+
+  - platform: template
+    name: "Senso4s Battery"
+    id: senso4s_battery
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+
+  # ----------------------------------------------------------
+  # B2/B3 interpreted as a 16-bit little-endian counter
+  #
+  #   value = B2 + (B3 * 256)
+  #
+  # The meaning of this counter is experimental.
+  # ----------------------------------------------------------
+
+  - platform: template
+    name: "Senso4s Prognosis Counter"
+    id: senso4s_prognosis_counter
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+
+  # ----------------------------------------------------------
+  # EXPERIMENTAL:
+  #
+  # Empirical interpretation of the B2/B3 counter:
+  #
+  #   1 counter step ≈ 15 minutes
+  #
+  # Therefore:
+  #
+  #   hours = counter / 4
+  #
+  # This has NOT been verified as an official protocol
+  # definition.
+  # ----------------------------------------------------------
+
+  - platform: template
+    name: "Senso4s Estimated Remaining Time"
+    id: senso4s_remaining_time
+    unit_of_measurement: "h"
+    device_class: duration
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+
+
+# ============================================================
+# TEXT SENSORS
+# ============================================================
+
+text_sensor:
+
+  # ----------------------------------------------------------
+  # Senso4s model
+  #
+  # Model is derived from the upper nibble of B0.
+  # ----------------------------------------------------------
+
+  - platform: template
+    name: "Senso4s Model"
+    id: senso4s_model
+    update_interval: never
+
+
+  # ----------------------------------------------------------
+  # Usage mode
+  #
+  # Usage mode is derived from the lower nibble of B0.
+  # ----------------------------------------------------------
+
+  - platform: template
+    name: "Senso4s Usage"
+    id: senso4s_usage
+    update_interval: never
+
+
+# ============================================================
+# BLE TRACKER
+# ============================================================
+
+esp32_ble_tracker:
+
+  on_ble_manufacturer_data_advertise:
+
+    # --------------------------------------------------------
+    # Senso4s manufacturer ID
+    #
+    # No MAC address is specified here.
+    #
+    # This makes the configuration generic and allows it to
+    # detect multiple Senso4s devices.
+    # --------------------------------------------------------
+
+    - manufacturer_id: "09CC"
+
+      then:
+
+        - lambda: |-
+
+            // ------------------------------------------------
+            // Check packet length
+            // ------------------------------------------------
+
+            if (x.size() < 12) {
+
+              ESP_LOGW(
+                "SENSO4S",
+                "Packet too short: %d bytes",
+                x.size()
+              );
+
+              return;
+            }
+
+
+            // ------------------------------------------------
+            // Store the first 12 bytes
+            // ------------------------------------------------
+
+            for (int i = 0; i < 12; i++) {
+              id(senso4s_data)[i] = x[i];
+            }
+
+            id(senso4s_initialized) = true;
+
+
+            // ------------------------------------------------
+            // Extract known fields
+            //
+            // B0     = flags
+            // B1     = gas level
+            // B2/B3  = experimental prognosis value
+            // B4     = battery level
+            // B5     = unknown
+            // B6-B11 = device MAC
+            // ------------------------------------------------
+
+            uint8_t flags   = x[0];
+            uint8_t gas_raw = x[1];
+            uint8_t b2      = x[2];
+            uint8_t b3      = x[3];
+            uint8_t battery = x[4];
+
+
+            // ------------------------------------------------
+            // Decode model
+            //
+            // Upper nibble of B0:
+            //
+            //   0x0-0x7 = PLUS
+            //   0x8     = BASIC
+            //   other   = UNKNOWN
+            //
+            // Example:
+            //   B0 = 0x81 -> BASIC
+            // ------------------------------------------------
+
+            uint8_t model_nibble = flags >> 4;
+
+            const char *model;
+
+            if (model_nibble < 0x08) {
+              model = "PLUS";
+            }
+            else if (model_nibble == 0x08) {
+              model = "BASIC";
+            }
+            else {
+              model = "UNKNOWN";
+            }
+
+
+            // ------------------------------------------------
+            // Decode usage mode
+            //
+            // Lower nibble of B0:
+            //
+            //   1 = BBQ
+            //   2 = Camping
+            //   3 = Caravanning
+            //   4 = Heating
+            //   5 = Household
+            //
+            // The mapping is based on observed Senso4s data.
+            // ------------------------------------------------
+
+            uint8_t usage_mode = flags & 0x0F;
+
+            const char *usage;
+
+            switch (usage_mode) {
+
+              case 1:
+                usage = "BBQ";
+                break;
+
+              case 2:
+                usage = "Camping";
+                break;
+
+              case 3:
+                usage = "Caravanning";
+                break;
+
+              case 4:
+                usage = "Heating";
+                break;
+
+              case 5:
+                usage = "Household";
+                break;
+
+              default:
+                usage = "Unknown";
+                break;
+            }
+
+
+            // ------------------------------------------------
+            // Publish verified values
+            // ------------------------------------------------
+
+            if (gas_raw <= 100) {
+              id(senso4s_gas_level).publish_state(gas_raw);
+            }
+
+            if (battery <= 100) {
+              id(senso4s_battery).publish_state(battery);
+            }
+
+            id(senso4s_model).publish_state(model);
+            id(senso4s_usage).publish_state(usage);
+
+
+            // ------------------------------------------------
+            // Combine B2/B3 into a 16-bit little-endian value
+            // ------------------------------------------------
+
+            uint16_t prognosis_counter =
+              (uint16_t)b2 |
+              ((uint16_t)b3 << 8);
+
+            id(senso4s_prognosis_counter)
+              .publish_state(prognosis_counter);
+
+
+            // ------------------------------------------------
+            // EXPERIMENTAL remaining-time calculation
+            //
+            // FF FF is treated as "not available".
+            // ------------------------------------------------
+
+            if (b2 != 0xFF || b3 != 0xFF) {
+
+              float remaining_hours =
+                prognosis_counter / 4.0f;
+
+              id(senso4s_remaining_time)
+                .publish_state(remaining_hours);
+
+            }
+            else {
+
+              id(senso4s_remaining_time)
+                .publish_state(NAN);
+            }
+
+
+            // ------------------------------------------------
+            // Only print the detailed packet log when a known
+            // value has changed.
+            // ------------------------------------------------
+
+            static bool initialized = false;
+
+            static uint8_t last_flags = 0;
+            static uint8_t last_gas = 0;
+            static uint8_t last_battery = 0;
+
+            bool changed =
+                !initialized ||
+                flags != last_flags ||
+                gas_raw != last_gas ||
+                battery != last_battery;
+
+            if (changed) {
+
+              initialized = true;
+
+              last_flags = flags;
+              last_gas = gas_raw;
+              last_battery = battery;
+
+
+              // ------------------------------------------------
+              // Build raw packet string
+              // ------------------------------------------------
+
+              std::string raw;
+
+              for (size_t i = 0; i < x.size(); i++) {
+
+                char buf[4];
+
+                snprintf(
+                  buf,
+                  sizeof(buf),
+                  "%02X ",
+                  x[i]
+                );
+
+                raw += buf;
+              }
+
+
+              // ------------------------------------------------
+              // Log packet
+              // ------------------------------------------------
+
+              ESP_LOGI(
+                "SENSO4S",
+                "========================================"
+              );
+
+              ESP_LOGI(
+                "SENSO4S",
+                "NEW VALUE"
+              );
+
+              ESP_LOGI(
+                "SENSO4S",
+                "RAW: %s",
+                raw.c_str()
+              );
+
+              ESP_LOGI(
+                "SENSO4S",
+                "Length: %d bytes",
+                x.size()
+              );
+
+
+              // ------------------------------------------------
+              // Log individual bytes
+              // ------------------------------------------------
+
+              ESP_LOGI(
+                "SENSO4S",
+                "B0=%02X B1=%02X B2=%02X B3=%02X B4=%02X B5=%02X",
+                x[0],
+                x[1],
+                x[2],
+                x[3],
+                x[4],
+                x[5]
+              );
+
+              ESP_LOGI(
+                "SENSO4S",
+                "B6=%02X B7=%02X B8=%02X B9=%02X B10=%02X B11=%02X",
+                x[6],
+                x[7],
+                x[8],
+                x[9],
+                x[10],
+                x[11]
+              );
+
+
+              // ------------------------------------------------
+              // Decimal values
+              // ------------------------------------------------
+
+              ESP_LOGI(
+                "SENSO4S",
+                "DEC: %u %u %u %u %u %u %u %u %u %u %u %u",
+                x[0],
+                x[1],
+                x[2],
+                x[3],
+                x[4],
+                x[5],
+                x[6],
+                x[7],
+                x[8],
+                x[9],
+                x[10],
+                x[11]
+              );
+
+
+              // ------------------------------------------------
+              // Decoded values
+              // ------------------------------------------------
+
+              if (gas_raw <= 100) {
+
+                ESP_LOGI(
+                  "SENSO4S",
+                  "DECODED: Gas=%u %% | B2=%u | B3=%u | Counter=%u | Estimated=%.1f h | Battery=%u %% | Model=%s | Usage=%s",
+                  gas_raw,
+                  b2,
+                  b3,
+                  prognosis_counter,
+                  prognosis_counter / 4.0f,
+                  battery,
+                  model,
+                  usage
+                );
+
+              }
+              else {
+
+                ESP_LOGI(
+                  "SENSO4S",
+                  "DECODED: Gas=INVALID (0x%02X) | B2=%u | B3=%u | Counter=%u | Battery=%u %% | Model=%s | Usage=%s",
+                  gas_raw,
+                  b2,
+                  b3,
+                  prognosis_counter,
+                  battery,
+                  model,
+                  usage
+                );
+              }
+
+
+              ESP_LOGI(
+                "SENSO4S",
+                "========================================"
+              );
+            }
+
+
+# ============================================================
+# PERIODIC LOGGING
+#
+# Prints the latest received packet once every minute.
+# This is useful during reverse engineering and testing.
+# ============================================================
+
+interval:
+
+  - interval: 60s
+
+    then:
+
+      - lambda: |-
+
+          // ------------------------------------------------
+          // Check whether any packet has been received
+          // ------------------------------------------------
+
+          if (!id(senso4s_initialized)) {
+
+            ESP_LOGI(
+              "SENSO4S",
+              "No Senso4s data received yet"
+            );
+
+            return;
+          }
+
+
+          // ------------------------------------------------
+          // Read latest stored packet
+          // ------------------------------------------------
+
+          uint8_t *d = id(senso4s_data);
+
+          uint8_t flags   = d[0];
+          uint8_t gas_raw = d[1];
+          uint8_t b2      = d[2];
+          uint8_t b3      = d[3];
+          uint8_t battery = d[4];
+
+
+          // ------------------------------------------------
+          // Decode model
+          // ------------------------------------------------
+
+          uint8_t model_nibble = flags >> 4;
+
+          const char *model;
+
+          if (model_nibble < 0x08) {
+            model = "PLUS";
+          }
+          else if (model_nibble == 0x08) {
+            model = "BASIC";
+          }
+          else {
+            model = "UNKNOWN";
+          }
+
+
+          // ------------------------------------------------
+          // Decode usage mode
+          // ------------------------------------------------
+
+          uint8_t usage_mode = flags & 0x0F;
+
+          const char *usage;
+
+          switch (usage_mode) {
+
+            case 1:
+              usage = "BBQ";
+              break;
+
+            case 2:
+              usage = "Camping";
+              break;
+
+            case 3:
+              usage = "Caravanning";
+              break;
+
+            case 4:
+              usage = "Heating";
+              break;
+
+            case 5:
+              usage = "Household";
+              break;
+
+            default:
+              usage = "Unknown";
+              break;
+          }
+
+
+          // ------------------------------------------------
+          // Decode experimental prognosis counter
+          // ------------------------------------------------
+
+          uint16_t prognosis_counter =
+            (uint16_t)b2 |
+            ((uint16_t)b3 << 8);
+
+
+          // ------------------------------------------------
+          // Periodic raw packet log
+          // ------------------------------------------------
+
+          ESP_LOGI(
+            "SENSO4S",
+            "========================================"
+          );
+
+          ESP_LOGI(
+            "SENSO4S",
+            "PERIODIC LOG - latest value"
+          );
+
+          ESP_LOGI(
+            "SENSO4S",
+            "RAW: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+            d[0],
+            d[1],
+            d[2],
+            d[3],
+            d[4],
+            d[5],
+            d[6],
+            d[7],
+            d[8],
+            d[9],
+            d[10],
+            d[11]
+          );
+
+          ESP_LOGI(
+            "SENSO4S",
+            "Length: 12 bytes"
+          );
+
+          ESP_LOGI(
+            "SENSO4S",
+            "B0=%02X B1=%02X B2=%02X B3=%02X B4=%02X B5=%02X",
+            d[0],
+            d[1],
+            d[2],
+            d[3],
+            d[4],
+            d[5]
+          );
+
+          ESP_LOGI(
+            "SENSO4S",
+            "B6=%02X B7=%02X B8=%02X B9=%02X B10=%02X B11=%02X",
+            d[6],
+            d[7],
+            d[8],
+            d[9],
+            d[10],
+            d[11]
+          );
+
+
+          // ------------------------------------------------
+          // Decimal values
+          // ------------------------------------------------
+
+          ESP_LOGI(
+            "SENSO4S",
+            "DEC: %u %u %u %u %u %u %u %u %u %u %u %u",
+            d[0],
+            d[1],
+            d[2],
+            d[3],
+            d[4],
+            d[5],
+            d[6],
+            d[7],
+            d[8],
+            d[9],
+            d[10],
+            d[11]
+          );
+
+
+          // ------------------------------------------------
+          // Decoded values
+          // ------------------------------------------------
+
+          if (gas_raw <= 100) {
+
+            ESP_LOGI(
+              "SENSO4S",
+              "DECODED: Gas=%u %% | B2=%u | B3=%u | Counter=%u | Estimated=%.1f h | Battery=%u %% | Model=%s | Usage=%s",
+              gas_raw,
+              b2,
+              b3,
+              prognosis_counter,
+              prognosis_counter / 4.0f,
+              battery,
+              model,
+              usage
+            );
+
+          }
+          else {
+
+            ESP_LOGI(
+              "SENSO4S",
+              "DECODED: Gas=INVALID (0x%02X) | B2=%u | B3=%u | Counter=%u | Battery=%u %% | Model=%s | Usage=%s",
+              gas_raw,
+              b2,
+              b3,
+              prognosis_counter,
+              battery,
+              model,
+              usage
+            );
+          }
+
+
+          ESP_LOGI(
+            "SENSO4S",
+            "========================================"
+          );
